@@ -21,7 +21,9 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on one machine: Windows 11, AMD RX 6700 XT; and on Linux under
+Proton Experimental: CachyOS, AMD RX 9070 XT (see
+[docs/linux-proton.md](docs/linux-proton.md)).
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -84,6 +86,12 @@ title's window has focus:
 | Q / E, Z / C | shoulders, triggers |
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
+
+### Linux (Proton)
+
+VIctory also runs on Linux under Proton Experimental, built with
+`cargo-xwin`, and gets as far there as on Windows: see
+[docs/linux-proton.md](docs/linux-proton.md) and `scripts/proton-run.sh`.
 
 ## Commands
 

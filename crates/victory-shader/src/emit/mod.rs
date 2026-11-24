@@ -402,6 +402,87 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     Ok(out)
 }
 
+/// A pixel shader for debug views (`VICTORY_DEBUG_PS` in the GPU crate):
+/// colours each pixel by the slope of its surface, from the screen-space
+/// derivatives of its depth (`SV_Position.z`), written to all `targets`
+/// colour targets. It reads nothing of the title's, so a draw's geometry
+/// shows whether or not its own pixel shader translates: a check that the
+/// vertex and mesh stages place what they draw where it belongs.
+pub fn debug_ps(targets: u32) -> HostShader {
+    use bitcode::{Attr, Bin, Term};
+    use container::SigElement;
+    let mut s = shader::Shader::new(true);
+    let b = s.entry;
+    let undef = s.m.undef(s.t.i32);
+    let load = |s: &mut shader::Shader, col: u8| {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), undef];
+        s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args)
+    };
+    let z = load(&mut s, 2);
+    let unary = |s: &mut shader::Shader, op: u32, v| s.op(b, "unary.f32", Attr::ReadNone, s.t.f32, op, &[v]);
+    // DerivCoarseX, DerivCoarseY: depth changes slowly, so scale it up.
+    let (dx, dy) = (unary(&mut s, 83, z), unary(&mut s, 84, z));
+    let k = s.m.f32((-4096.0f32).to_bits());
+    let nx = s.m.bin(b, Bin::Mul, dx, k);
+    let ny = s.m.bin(b, Bin::Mul, dy, k);
+    let one = s.m.f32(1.0f32.to_bits());
+    let half = s.m.f32(0.5f32.to_bits());
+    let xx = s.m.bin(b, Bin::Mul, nx, nx);
+    let yy = s.m.bin(b, Bin::Mul, ny, ny);
+    let sum = s.m.bin(b, Bin::Add, xx, yy);
+    let sum = s.m.bin(b, Bin::Add, sum, one);
+    let len = unary(&mut s, 24, sum); // Sqrt
+    let colour = |s: &mut shader::Shader, v| {
+        let n = s.m.bin(b, Bin::SDiv, v, len); // fdiv on floats
+        let n = s.m.bin(b, Bin::Mul, n, half);
+        s.m.bin(b, Bin::Add, n, half)
+    };
+    let rgb = [colour(&mut s, nx), colour(&mut s, ny), colour(&mut s, one)];
+    let targets = targets.clamp(1, 8);
+    for t in 0..targets {
+        for (col, v) in rgb.iter().copied().chain([one]).enumerate() {
+            let args = [s.m.i32(t), s.m.i32(0), s.m.i8(col as u8), v];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+    }
+    s.inputs = vec![SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0b0100,
+        half: false,
+    }];
+    s.outputs = (0..targets)
+        .map(|t| SigElement {
+            name: "SV_Target".into(),
+            index: t,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(t),
+            col: 0,
+            cols: 4,
+            usage: 0b1111,
+            half: false,
+        })
+        .collect();
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: HwStage::Ps,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
@@ -552,6 +633,18 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    fn debug_pixel_shader_makes_a_pipeline() {
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 device; skipped");
+            return;
+        };
+        let ps = super::debug_ps(3);
+        let vs = super::host::stub_vs(&ps).unwrap();
+        host.pipeline(&vs, &ps).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn stub_pipeline_is_created() {
         let Ok(host) = super::host::Host::new(false) else {
             eprintln!("no SM 6.6 device; skipped");
@@ -586,6 +679,16 @@ mod tests {
             v.validate(&mut vs.dxil.clone()).unwrap();
         }
         host.pipeline(&vs, &ps).unwrap();
+        // vkd3d-proton (Wine, Proton) does not check the container hash.
+        // SAFETY: plain lookups in ntdll, always loaded.
+        let wine = unsafe {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        };
+        if wine {
+            return;
+        }
         // The runtime checks the container hash: no hash or a wrong one is
         // refused. (Recent runtimes also take sixteen 0x01 bytes, a bypass
         // value; ours works with older ones too.)

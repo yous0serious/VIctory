@@ -494,6 +494,21 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.submit(&mut submitted, runs);
+    }
+
+    /// Runs a title's submission: as [`execute`](Self::execute), but first,
+    /// under the same lock, starts a new watch submission and refreshes heap
+    /// slots the title wrote. Inside the lock, another queue's submission
+    /// can't refresh a heap while this one's GPU work still reads it.
+    pub(crate) fn execute_title(&self, runs: &[&HostList]) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        crate::watch::new_submission();
+        crate::descriptor::resync_title_writes();
+        self.submit(&mut submitted, runs);
+    }
+
+    fn submit(&self, submitted: &mut u64, runs: &[&HostList]) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1588,6 +1603,14 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        // Diagnostics: an intermediate target instead (VICTORY_SHOW_TARGET).
+        #[cfg(feature = "diagnostics")]
+        let shown = crate::capture::take_shown();
+        #[cfg(feature = "diagnostics")]
+        let (texture, state) = match &shown {
+            Some((copy, s)) => (&copy.texture, *s),
+            None => (texture, state),
+        };
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {

@@ -59,6 +59,11 @@ pub(crate) struct Heap {
     host: std::sync::OnceLock<Option<host::HostHeap>>,
     #[cfg(windows)]
     pending: std::sync::Mutex<Vec<u32>>,
+    /// The write-watch asking (see [`crate::watch::writes`]) up to which
+    /// the host heap has caught up with what the title wrote into its
+    /// memory itself (see [`resync_title_writes`]).
+    #[cfg(windows)]
+    synced: std::sync::atomic::AtomicU64,
 }
 
 pub(crate) fn heap<'a>(this: This) -> &'a Heap {
@@ -143,6 +148,49 @@ fn mirror(handle: u64) {
             drop(pending);
             if let Some(host) = host {
                 host.mirror(index, handle, false);
+            }
+        }
+    }
+}
+
+/// Brings the host heaps up to date with descriptors the title wrote into
+/// heap memory itself (copies of whole slots, which no create or copy call
+/// reports), before a submission runs: slots read directly by index (not
+/// through a table) are made only from what was mirrored, so a slot the
+/// title turned from a texture into a constant buffer kept the texture,
+/// whose upper half the shader read as a buffer at address 0: a GPU page
+/// fault and a lost device in the world. Only the 64 KiB blocks written
+/// since the last call are looked at; heaps in memory the kernel does not
+/// watch (ours, not the title's) are left as they are.
+#[cfg(windows)]
+pub(crate) fn resync_title_writes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Held throughout: registered heaps stay alive while it is.
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    for &(start, end, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        let (Some(Some(host)), Some(step)) = (heap.host.get(), increment(heap.desc.kind)) else {
+            continue; // no host heap yet: its first use mirrors everything
+        };
+        let page = crate::watch::PAGE as u64;
+        let (first, last) = (start / page * page, end.div_ceil(page) * page);
+        let Some((now, written)) = crate::watch::writes(first as usize, last as usize, true) else {
+            continue;
+        };
+        let before = heap.synced.swap(now, Relaxed);
+        let step = u64::from(step);
+        for (p, asked) in written {
+            if asked <= before {
+                continue;
+            }
+            let from = (p as u64 * page).max(start);
+            let to = ((p as u64 + 1) * page).min(end);
+            for i in (from - start) / step..(to - start).div_ceil(step) {
+                let i = i as u32;
+                if i < heap.desc.count {
+                    host.mirror(i, start + u64::from(i) * step, false);
+                }
             }
         }
     }
@@ -624,6 +672,8 @@ pub(crate) extern "system" fn create_heap(
         host: std::sync::OnceLock::new(),
         #[cfg(windows)]
         pending: Default::default(),
+        #[cfg(windows)]
+        synced: std::sync::atomic::AtomicU64::new(0),
     });
     #[cfg(windows)]
     if visible {

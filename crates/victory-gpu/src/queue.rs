@@ -123,7 +123,7 @@ extern "system" fn execute(_: This, count: u32, lists: *const This) {
             .iter()
             .filter_map(|&l| crate::list::host_list(l))
             .collect();
-        host.execute(&host_lists);
+        host.execute_title(&host_lists);
         return;
     }
     static ONCE: AtomicBool = AtomicBool::new(false);

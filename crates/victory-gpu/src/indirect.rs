@@ -4,7 +4,8 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! the system's compiler as a 5.1 shader; its root signature is built here,
+//! since Wine's compiler does not embed one).
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -23,48 +24,53 @@ use windows::core::s;
 
 use crate::host::{HostList, host, transition};
 
+// Written for both compilers `D3DCompile` may be: Microsoft's and, under
+// Wine, vkd3d-shader's, which has no `RWByteAddressBuffer` methods. So the
+// buffers are structured buffers of words (a root UAV takes either).
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
+RWStructuredBuffer<uint> args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
-    uint at = id.x * stride;
+    uint at = id.x * (stride / 4);
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(args[at], 1u << 24);
+        uint instances = min(args[at + 1], (1u << 26) / max(count, 1u));
         cost = count * instances;
-        args.Store2(at, uint2(count, instances));
+        args[at] = count;
+        args[at + 1] = instances;
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = min(uint3(args[at], args[at + 1], args[at + 2]), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
+        args[at] = g.x;
+        args[at + 1] = g.y;
+        args[at + 2] = g.z;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        uint3 g = uint3(min(args[at], 65535u), min(args[at + 1], 1u), min(args[at + 2], 1u));
         cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
+        args[at] = g.x;
+        args[at + 1] = g.y;
+        args[at + 2] = g.z;
     }
     uint before;
-    budget.InterlockedAdd(0, cost, before);
+    InterlockedAdd(budget[0], cost, before);
     if (before >= BUDGET || before + cost > BUDGET) {
         // Draws keep their layout with no vertices; groups become zero.
-        args.Store(at, 0);
+        args[at] = 0;
     }
 }
 "#;
@@ -123,10 +129,10 @@ fn make() -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -136,6 +142,45 @@ fn make() -> windows::core::Result<Clamp> {
             ..Default::default()
         })?;
         Ok(Clamp { root, pso })
+    }
+}
+
+/// Constants b0 (four words: kind, stride, records, unused), then the
+/// arguments as root UAV u0 and the budget as root UAV u1.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let uav = |register| D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: register, RegisterSpace: 0 },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 4 },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        uav(0),
+        uav(1),
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    // SAFETY: the description points at a live array; the blob is read in
+    // full before it is released.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes = std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
     }
 }
 
@@ -213,5 +258,77 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// The clamp bounds a draw, a dispatch and a mesh dispatch on the GPU.
+    #[test]
+    fn arguments_are_clamped_on_the_gpu() {
+        clamp_on_the_gpu(false);
+    }
+
+    /// The same in a list with the title's kind of descriptor heaps bound
+    /// (under vkd3d-proton the clamp then faulted on address 0).
+    #[test]
+    fn arguments_are_clamped_with_heaps_bound() {
+        clamp_on_the_gpu(true);
+    }
+
+    fn clamp_on_the_gpu(heaps: bool) {
+        use super::*;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (buffer, data) = host.shared_buffer(256).unwrap();
+        let words = data.cast::<u32>();
+        let records: [(usize, [u32; 4]); 3] = [
+            (0, [u32::MAX, 5, 0, 0]), // draw: vertices, instances
+            (16, [70_000, 2, 3, 0]),  // dispatch
+            (32, [100_000, 7, 9, 0]), // mesh dispatch
+        ];
+        for (at, w) in records {
+            // SAFETY: inside the mapped 256 bytes.
+            unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), words.add(at / 4), 4) };
+        }
+        let list = host.new_list().unwrap();
+        if heaps {
+            let heap = |kind, count| -> ID3D12DescriptorHeap {
+                // SAFETY: plain heap creation.
+                unsafe {
+                    host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: count,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+                }
+                .unwrap()
+            };
+            let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1024);
+            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 16);
+            // SAFETY: an open list and shader-visible heaps it keeps alive.
+            unsafe { list.list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.clone())]) };
+            list.keep(&views);
+            list.keep(&samplers);
+        }
+        // SAFETY: a live buffer and an open list.
+        let gpu = unsafe {
+            list.list.ResourceBarrier(&[transition(
+                &buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            )]);
+            buffer.GetGPUVirtualAddress()
+        };
+        for (kind, at, stride) in [(0, 0, 16), (2, 16, 12), (3, 32, 12)] {
+            assert!(bound(&list, &buffer, gpu + at, (kind, stride, 1)));
+            done(&list, &buffer);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the list ran (execute waits); inside the mapped bytes.
+        let read = |at: usize| unsafe { std::slice::from_raw_parts(words.add(at / 4), 3).to_vec() };
+        assert_eq!(read(0)[..2], [1 << 24, 4]);
+        assert_eq!(read(16), [65_535, 2, 3]);
+        assert_eq!(read(32), [65_535, 1, 1]);
     }
 }

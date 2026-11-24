@@ -74,6 +74,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Root SRV views made in this list: (title heap, title address) →
+    /// dynamic slot (see [`State::bind_root_srv`]).
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -493,6 +496,12 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    // Root SRVs are bounded one-view tables (see the host
+                    // root signature).
+                    if srv {
+                        self.bind_root_srv(list, compute, slot, param);
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -514,6 +523,70 @@ impl State {
             }
         }
         true
+    }
+
+    /// Binds the title's root SRV `slot` as the one-view table `param` (see
+    /// the host root signature): a raw view of the rest of the title
+    /// buffer's host copy, in a dynamic slot of the bound view heap, so
+    /// reads past the copy return zeros rather than fault. Zeros (our null
+    /// buffer) if the title set none or it lies outside every buffer.
+    fn bind_root_srv(&mut self, list: &HostList, compute: bool, slot: u8, param: u32) {
+        let l = &list.list;
+        let heap = self.heaps[0];
+        if heap == 0 {
+            once!("a root SRV with no view heap bound: left unset");
+            return;
+        }
+        let title_heap = crate::descriptor::heap(heap as This);
+        let Some(host) = title_heap.host() else { return };
+        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(Root::View(address)) => *address,
+            _ => 0,
+        };
+        let shadow = crate::shadow::find(address, 1).filter(|_| address != 0).map(|s| (s, address));
+        // The same buffer again in this list: its slot, refreshed again.
+        if let Some(&index) = self.root_srv_slots.get(&(heap, address)) {
+            if let Some((shadow, address)) = &shadow {
+                shadow.refresh(list, *address, shadow.left(*address).min(1 << 20));
+            }
+            let table = host.gpu_handle(index);
+            // SAFETY: an open list; the slot is held by this list.
+            unsafe {
+                if compute {
+                    l.SetComputeRootDescriptorTable(param, table);
+                } else {
+                    l.SetGraphicsRootDescriptorTable(param, table);
+                }
+            }
+            return;
+        }
+        let Some(index) = host.dynamic(1) else {
+            once!("no free dynamic slot for a root SRV: left unset");
+            return;
+        };
+        self.dynamic.push((heap, index, 1));
+        self.root_srv_slots.insert((heap, address), index);
+        match shadow {
+            Some((shadow, address)) => {
+                let len = shadow.left(address);
+                shadow.refresh(list, address, len.min(1 << 20));
+                host.raw_srv_at(index, &shadow.buffer, shadow.offset(address), len);
+            }
+            None => {
+                once!(slot, "a root SRV the title did not set, or outside every buffer: reads zeros");
+                host.make_null(index);
+            }
+        }
+        let table = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound heap and held by
+        // this list until it is reset.
+        unsafe {
+            if compute {
+                l.SetComputeRootDescriptorTable(param, table);
+            } else {
+                l.SetGraphicsRootDescriptorTable(param, table);
+            }
+        }
     }
 
     /// Runs a dispatch on the host.

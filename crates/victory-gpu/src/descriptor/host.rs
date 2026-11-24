@@ -306,6 +306,39 @@ impl HostHeap {
         }
     }
 
+    /// The shader-visible handle of slot `index`.
+    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        D3D12_GPU_DESCRIPTOR_HANDLE { ptr: start + u64::from(index) * u64::from(self.step) }
+    }
+
+    /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
+    /// of `buffer` from byte `offset` (4-byte units, rounded down), holding
+    /// the buffer while the slot does.
+    pub(crate) fn raw_srv_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a live buffer and a slot of our heap; the range lies in it.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+        };
+        self.keep(index, Some(buffer.clone()));
+    }
+
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
