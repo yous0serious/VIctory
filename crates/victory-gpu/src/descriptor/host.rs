@@ -353,7 +353,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Kept::Resource { _resource: buffer.clone() });
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host

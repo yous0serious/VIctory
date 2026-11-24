@@ -631,7 +631,7 @@ mod tests {
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
         };
         assert_ne!(view, 0);
-        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        assert!(guard(view, view + 2 * BLOCK, false).is_some()); // now read-only
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"from the disk").unwrap();
         let read = |file: &mut std::fs::File| {
@@ -641,14 +641,14 @@ mod tests {
             file.read(into).is_ok_and(|n| n == 13)
         };
         kernel_will_write(view + 100, 13); // the title's thread, in `ReadFile`
-        let _ = guard(view, view + 2 * BLOCK); // a refresh on another thread
+        let _ = guard(view, view + 2 * BLOCK, false); // a refresh on another thread
         assert!(
             read(&mut file),
             "the refresh guarded the block again under the read"
         );
         kernel_wrote(view + 100, 13);
         assert_eq!(
-            guard(view, view + 2 * BLOCK),
+            guard(view, view + 2 * BLOCK, false),
             Some((view / PAGE..view / PAGE + 1).collect())
         );
         assert!(!read(&mut file), "guarded again once the read is done");
