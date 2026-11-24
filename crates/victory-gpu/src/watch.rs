@@ -268,11 +268,17 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Announced kernel writes still to land, as block ranges `[first,
+    /// end)`, one per announcement: their blocks are left open until they
+    /// have, however many refreshes come first. Ranges, not blocks, since
+    /// an announced length can be the title's saturated `fread` size.
+    announced: Vec<(usize, usize)>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    announced: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -305,7 +311,7 @@ fn guard(start: usize, end: usize, known_mapped: bool) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.announced.iter().any(|&(a, e)| (a..e).contains(&block)) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -369,11 +375,32 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
-/// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
-pub fn writing(at: usize, len: usize) {
+/// For the title's kernel reads, which other threads' refreshes can
+/// overtake, the runtime calls [`kernel_will_write`] instead.
+pub(crate) fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
+}
+
+/// Before the title's kernel read into its memory `[at, at + len)`: opens
+/// the guarded blocks there and keeps them open until [`kernel_wrote`]. A
+/// refresh on another thread in between would otherwise guard them again,
+/// and the read would fail.
+pub fn kernel_will_write(at: usize, len: usize) {
+    let end = at.saturating_add(len);
+    let mut g = guards();
+    open(&mut g, at, end);
+    g.announced.push((at / BLOCK, end.div_ceil(BLOCK)));
+}
+
+/// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
+/// has landed (or failed); its blocks can be guarded again.
+pub fn kernel_wrote(at: usize, len: usize) {
+    let blocks = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    if let Some(i) = g.announced.iter().position(|&r| r == blocks) {
+        g.announced.swap_remove(i);
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -568,5 +595,71 @@ mod tests {
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
+    }
+
+    /// A kernel read announced with the title's saturated length (`fread`'s
+    /// size times count) costs what a short one does. Above user space, so
+    /// no other test's blocks are in it.
+    #[test]
+    fn an_announcement_as_long_as_the_address_space_is_cheap() {
+        let high = usize::MAX / 2;
+        kernel_will_write(high, usize::MAX);
+        kernel_wrote(high, usize::MAX);
+        assert!(!guards().announced.contains(&(high / BLOCK, usize::MAX.div_ceil(BLOCK))));
+    }
+
+    /// A kernel read announced with `kernel_will_write` survives a refresh
+    /// on another thread before it lands; once `kernel_wrote` says it has,
+    /// the next refresh guards its block again.
+    #[test]
+    fn an_announced_kernel_read_survives_a_refresh_before_it() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some()); // now read-only
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        let read = |file: &mut std::fs::File| {
+            file.rewind().unwrap();
+            // SAFETY: 13 bytes of our view, nothing else refers to them.
+            let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
+            file.read(into).is_ok_and(|n| n == 13)
+        };
+        kernel_will_write(view + 100, 13); // the title's thread, in `ReadFile`
+        let _ = guard(view, view + 2 * BLOCK); // a refresh on another thread
+        assert!(
+            read(&mut file),
+            "the refresh guarded the block again under the read"
+        );
+        kernel_wrote(view + 100, 13);
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some((view / PAGE..view / PAGE + 1).collect())
+        );
+        assert!(!read(&mut file), "guarded again once the read is done");
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(
+                windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: view as *mut _,
+                },
+            )
+        };
+        title_memory_remapped(view, 2 * BLOCK);
     }
 }
