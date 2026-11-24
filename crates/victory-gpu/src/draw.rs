@@ -702,8 +702,8 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u, &view);
+        if let Some((view, copy)) = host.mirror(index, handle, true) {
+            readable(list, u, &view, copy.as_ref());
         }
     }
 
@@ -790,7 +790,8 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                        let copy = host.copy_at(first + u.table_offset_dwords / 8);
+                        readable(list, u, &view, copy.as_ref());
                     }
                 }
                 made.push((slot, first * 32));
@@ -823,9 +824,9 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let copy = host.make_at(index, &view);
                         if let Some(u) = used {
-                            readable(list, u, &view);
+                            readable(list, u, &view, copy.as_ref());
                         }
                     }
                     None => {
@@ -1174,21 +1175,40 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
-/// copied, textures moved to the state they need.
-fn readable(list: &HostList, u: &UsedResource, view: &View) {
+/// copied, textures moved to the state they need. `copy` is the copy of
+/// title buffer memory the view's slot is of (`HostHeap::copy_at`).
+fn readable(
+    list: &HostList,
+    u: &UsedResource,
+    view: &View,
+    copy: Option<&std::sync::Arc<crate::shadow::Shadow>>,
+) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    // Both go through the copy the slot is of, not one looked up again from
+    // the view's range: that can be another, overlapping title buffer's,
+    // and a view off its buffer copy's elements has a copy of just its
+    // bytes. That one is a host copy like any other, so its own refresh
+    // brings it up to date from title memory (which the last submission's
+    // copy-back already wrote), and what shaders write in it goes back from
+    // it.
+    // shortcut: such a copy is brought up to date from title memory when the
+    // submission is prepared, so it does not see what a shader of the same
+    // submission wrote in that range through another view, nor do they see
+    // its writes until the next one. Getting that right needs every host
+    // buffer's state tracked across the submission (PR #334), so that the
+    // bytes can be copied on the GPU inside the list instead.
+    if let Some(copy) = copy
+        && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
         && len > 0
-        && let Some(shadow) = crate::shadow::find(address, len)
     {
-        shadow.refresh(list, address, len);
+        copy.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
-            shadow.gpu_writes(list, address, len);
+            copy.gpu_writes(list, address, len);
         }
     }
     match (view, u.kind) {
